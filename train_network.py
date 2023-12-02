@@ -149,8 +149,8 @@ class NetworkTrainer:
     def sample_images(self, accelerator, args, epoch, global_step, device, vae, tokenizer, text_encoder, unet):
         train_util.sample_images(accelerator, args, epoch, global_step, device, vae, tokenizer, text_encoder, unet)
 
-    def save_embeds_weights(self, file, updated_embs, save_dtype, metadata):
-        state_dict = {"emb_params": updated_embs[0]}
+    def save_embeds_weights(self, file, embeddings, save_dtype, metadata):
+        state_dict = {"emb_params": embeddings}
 
         if save_dtype is not None:
             for key in list(state_dict.keys()):
@@ -182,6 +182,7 @@ class NetworkTrainer:
         train_dataloader,
         num_train_epochs,
         max_train_steps,
+        token_ids_to_string,
         token_ids_list,
         orig_embeds_params_list,
         index_no_updates_list,
@@ -196,17 +197,15 @@ class NetworkTrainer:
         loss_recorder = train_util.LossRecorder()
 
         # function for saving/removing
-        def save_embeddings(ckpt_name, embs_list):
+        def save_embeddings(embed_name, embeddings):
             os.makedirs(args.output_dir, exist_ok=True)
-            embeds_file = os.path.join(args.output_dir, ckpt_name)
+            embeds_file = os.path.join(args.output_dir, embed_name)
 
             accelerator.print(f"\nsaving embeddings: {embeds_file}")
 
             sai_metadata = train_util.get_sai_model_spec(None, args, self.is_sdxl, True, False)
-
-            if len(embs_list) > 0:
-                embeds_file = os.path.join(args.output_dir, "embeds-" + ckpt_name)
-                self.save_embeds_weights(embeds_file, embs_list, save_dtype, sai_metadata)
+            embeds_file = os.path.join(args.output_dir, embed_name)
+            self.save_embeds_weights(embeds_file, embeddings, save_dtype, sai_metadata)
 
         # training loop
         for epoch in range(num_train_epochs):
@@ -296,8 +295,8 @@ class NetworkTrainer:
 
                     # Let's make sure we don't update any embedding weights besides the newly added token
                     with torch.no_grad():
-                        for text_encoder, orig_embeds_params, index_no_updates in zip(
-                            text_encoders, orig_embeds_params_list, index_no_updates_list
+                        for orig_embeds_params, index_no_updates in zip(
+                            orig_embeds_params_list, index_no_updates_list
                         ):
                             accelerator.unwrap_model(text_encoder).get_input_embeddings().weight[
                                 index_no_updates
@@ -315,18 +314,17 @@ class NetworkTrainer:
                     if args.save_every_n_steps is not None and global_step % args.save_every_n_steps == 0:
                         accelerator.wait_for_everyone()
                         if accelerator.is_main_process:
-                            for text_encoder, token_ids in zip(text_encoders, token_ids_list):
+                            for token_id in token_ids_list:
                                 updated_embs = (
                                     accelerator.unwrap_model(text_encoder)
                                     .get_input_embeddings()
-                                    .weight[token_ids]
+                                    .weight[token_id]
                                     .data.detach()
                                     .clone()
                                 )
-                                updated_embs_list.append(updated_embs)
-
-                            ckpt_name = train_util.get_step_ckpt_name(args, "." + args.save_model_as, global_step)
-                            save_embeddings(ckpt_name, updated_embs_list)
+                                emb_name = token_ids_to_string[token_id]
+                                ckpt_name = train_util.get_step_ckpt_name(args,  "." + args.save_model_as, global_step, emb_name)
+                                save_embeddings(ckpt_name, updated_embs)
 
                 current_loss = loss.detach().item()
                 loss_recorder.add(epoch=epoch, step=step, loss=current_loss)
@@ -347,17 +345,15 @@ class NetworkTrainer:
 
             accelerator.wait_for_everyone()
 
-            updated_embs_list = []
-            for text_encoder, token_ids in zip(text_encoders, token_ids_list):
-                updated_embs = accelerator.unwrap_model(text_encoder).get_input_embeddings().weight[token_ids].data.detach().clone()
-                updated_embs_list.append(updated_embs)
-
             # 指定エポックごとにモデルを保存
             if args.save_every_n_epochs is not None:
                 saving = (epoch + 1) % args.save_every_n_epochs == 0 and (epoch + 1) < num_train_epochs
                 if accelerator.is_main_process and saving:
-                    ckpt_name = train_util.get_epoch_ckpt_name(args, "." + args.save_model_as, epoch + 1)
-                    save_embeddings(ckpt_name, updated_embs_list)
+                    for token_id in token_ids_list:
+                        updated_embs = accelerator.unwrap_model(text_encoder).get_input_embeddings().weight[token_id].data.detach().clone()
+                        emb_name = token_ids_to_string[token_id]
+                        ckpt_name = train_util.get_step_ckpt_name(args,  "." + args.save_model_as, global_step, emb_name)
+                        save_embeddings(ckpt_name, updated_embs)
 
                     if args.save_state:
                         train_util.save_and_remove_state_on_epoch_end(args, accelerator, epoch + 1)
@@ -383,9 +379,16 @@ class NetworkTrainer:
 
         # save last steps
         text_encoder = accelerator.unwrap_model(text_encoder)
-        updated_embs = text_encoder.get_input_embeddings().weight[token_ids].data.detach().clone()
-        ckpt_name = train_util.get_last_ckpt_name(args, "." + args.save_model_as)
-        save_embeddings(ckpt_name, updated_embs_list)
+
+        embs_map = {}
+        for token_id in token_ids_list:
+            updated_embs = text_encoder.get_input_embeddings().weight[token_id].data.detach().clone()
+            emb_name = token_ids_to_string[token_id]
+            ckpt_name = train_util.get_last_ckpt_name(args,  "." + args.save_model_as, emb_name)
+            save_embeddings(ckpt_name, updated_embs)
+            embs_map[emb_name] = updated_embs
+
+        return embs_map
 
     def train(self, args):
         session_id = random.randint(0, 2**32)
@@ -435,38 +438,41 @@ class NetworkTrainer:
             token_strings = args.embeddings
             token_ids_list = []
             token_embeds_list = []
+            token_ids_to_string = {}
             for i, (tokenizer, text_encoder) in enumerate(zip(tokenizers, text_encoders)):
-                num_added_tokens = tokenizer.add_tokens(token_strings)
-                assert (
-                    num_added_tokens != 0 # TODO: args.num_vectors_per_token?
-                ), f"The tokenizer already contains one of the tokens {token_strings}. Please pass a different word that is not already in the tokenizer."
+                for token_string in token_strings:
+                    num_added_tokens = tokenizer.add_tokens(token_string)
+                    assert (
+                        num_added_tokens != 0 # TODO: args.num_vectors_per_token?
+                    ), f"The tokenizer already contains {token_string}. Please pass a different word that is not already in the tokenizer."
 
-                token_ids = tokenizer.convert_tokens_to_ids(token_strings)
-                accelerator.print(f"tokens are added for tokenizer {i+1}: {token_ids}")
-                assert (
-                    min(token_ids) == token_ids[0] and token_ids[-1] == token_ids[0] + len(token_ids) - 1
-                ), f"token ids is not ordered : tokenizer {i+1}, {token_ids}"
-                assert (
-                    len(tokenizer) - 1 == token_ids[-1]
-                ), f"token ids is not end of tokenize: tokenizer {i+1}, {token_ids}, {len(tokenizer)}"
-                token_ids_list.append(token_ids)
+                    token_id = tokenizer.convert_tokens_to_ids(token_string)
+                    token_ids_to_string[token_id] = token_string
+                    accelerator.print(f"tokens are added for tokenizer {i+1}: {token_id}")
+                    # assert (
+                    #     min(token_ids) == token_ids[0] and token_ids[-1] == token_ids[0] + len(token_ids) - 1
+                    # ), f"token ids is not ordered : tokenizer {i+1}, {token_ids}"
+                    assert (
+                        len(tokenizer) - 1 == token_id
+                    ), f"token ids is not end of tokenize: tokenizer {i+1}, {token_ids}, {len(tokenizer)}"
+                    token_ids_list.append(token_id)
 
-                # Resize the token embeddings as we are adding new special tokens to the tokenizer
-                text_encoder.resize_token_embeddings(len(tokenizer))
+                    # Resize the token embeddings as we are adding new special tokens to the tokenizer
+                    text_encoder.resize_token_embeddings(len(tokenizer))
 
-                # TODO: Initialise the newly added placeholder token with the embeddings of the initializer token
-                token_embeds = text_encoder.get_input_embeddings().weight.data
+                    # TODO: Initialise the newly added placeholder token with the embeddings of the initializer token
+                    token_embeds = text_encoder.get_input_embeddings().weight.data
 
-                # init token values
-                # TODO: add token_string for initialization (in args)
-                for i, token_id in enumerate(token_ids):
+                    # init token values
+                    # TODO: add token_string for initialization (in args)
+                    # for i, token_id in enumerate(token_ids):
                     sigma_val = 0.5
                     token_embeds[token_id] = torch.randn_like(token_embeds[0]) * sigma_val
                     print(
                         f"Initialized {token_id} with random noise (sigma={sigma_val}), empirically {token_embeds[token_id].mean().item():.3f} +- {token_embeds[token_id].std().item():.3f}"
                     )
 
-                token_embeds_list.append(token_embeds)
+                    token_embeds_list.append(token_embeds)
 
         # データセットを準備する
         if args.dataset_class is None:
@@ -752,8 +758,8 @@ class NetworkTrainer:
         if pivotal_tuning:
             index_no_updates_list = []
             orig_embeds_params_list = []
-            for tokenizer, token_ids, text_encoder in zip(tokenizers, token_ids_list, text_encoders):
-                index_no_updates = torch.arange(len(tokenizer)) < token_ids[0]
+            for token_id in token_ids_list:
+                index_no_updates = torch.arange(len(tokenizer)) < token_id
                 index_no_updates_list.append(index_no_updates)
 
                 # accelerator.print(len(index_no_updates), torch.sum(index_no_updates))
@@ -1057,7 +1063,7 @@ class NetworkTrainer:
             on_step_start = lambda *args, **kwargs: None
 
         # function for saving/removing
-        def save_model(ckpt_name, unwrapped_nw, steps, epoch_no, force_sync_upload=False):
+        def save_model(ckpt_name, unwrapped_nw, steps, epoch_no, embeddings_map, force_sync_upload=False):
             os.makedirs(args.output_dir, exist_ok=True)
             ckpt_file = os.path.join(args.output_dir, ckpt_name)
 
@@ -1069,6 +1075,9 @@ class NetworkTrainer:
             metadata_to_save = minimum_metadata if args.no_metadata else metadata
             sai_metadata = train_util.get_sai_model_spec(None, args, self.is_sdxl, True, False)
             metadata_to_save.update(sai_metadata)
+
+            for emb_name in embeddings_map.keys():
+                unwrapped_nw.state_dict()[f"bundle_emb.{emb_name}.weight"] = embeddings_map[emb_name]
 
             unwrapped_nw.save_weights(ckpt_file, save_dtype, metadata_to_save)
             if args.huggingface_repo_id is not None:
@@ -1083,7 +1092,7 @@ class NetworkTrainer:
         if pivotal_tuning:
             num_train_epochs_ti = math.ceil(args.embeddings_max_train_steps / num_update_steps_per_epoch)
             max_train_steps_ti = args.embeddings_max_train_steps
-            self.train_inversion(
+            embeddings_map = self.train_inversion(
                 args,
                 accelerator,
                 unet,
@@ -1099,6 +1108,7 @@ class NetworkTrainer:
                 train_dataloader,
                 num_train_epochs_ti,
                 max_train_steps_ti,
+                token_ids_to_string,
                 token_ids_list,
                 orig_embeds_params_list,
                 index_no_updates_list,
@@ -1222,7 +1232,7 @@ class NetworkTrainer:
                         accelerator.wait_for_everyone()
                         if accelerator.is_main_process:
                             ckpt_name = train_util.get_step_ckpt_name(args, "." + args.save_model_as, global_step)
-                            save_model(ckpt_name, accelerator.unwrap_model(network), global_step, epoch)
+                            save_model(ckpt_name, accelerator.unwrap_model(network), global_step, epoch, embeddings_map)
 
                             if args.save_state:
                                 train_util.save_and_remove_state_stepwise(args, accelerator, global_step)
@@ -1259,7 +1269,7 @@ class NetworkTrainer:
                 saving = (epoch + 1) % args.save_every_n_epochs == 0 and (epoch + 1) < num_train_epochs
                 if is_main_process and saving:
                     ckpt_name = train_util.get_epoch_ckpt_name(args, "." + args.save_model_as, epoch + 1)
-                    save_model(ckpt_name, accelerator.unwrap_model(network), global_step, epoch + 1)
+                    save_model(ckpt_name, accelerator.unwrap_model(network), global_step, epoch + 1, embeddings_map)
 
                     remove_epoch_no = train_util.get_remove_epoch_no(args, epoch + 1)
                     if remove_epoch_no is not None:
@@ -1296,7 +1306,7 @@ class NetworkTrainer:
 
         if is_main_process:
             ckpt_name = train_util.get_last_ckpt_name(args, "." + args.save_model_as)
-            save_model(ckpt_name, network, global_step, num_train_epochs, force_sync_upload=True)
+            save_model(ckpt_name, network, global_step, num_train_epochs, embeddings_map, force_sync_upload=True)
 
             print("model saved.")
 
