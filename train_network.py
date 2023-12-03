@@ -149,14 +149,11 @@ class NetworkTrainer:
     def sample_images(self, accelerator, args, epoch, global_step, device, vae, tokenizer, text_encoder, unet):
         train_util.sample_images(accelerator, args, epoch, global_step, device, vae, tokenizer, text_encoder, unet)
 
-    def save_embeds_weights(self, file, embeddings, save_dtype, metadata):
-        state_dict = {"emb_params": embeddings}
-
-        if save_dtype is not None:
-            for key in list(state_dict.keys()):
-                v = state_dict[key]
-                v = v.detach().clone().to("cpu").to(save_dtype)
-                state_dict[key] = v
+    def save_embeds_weights(self, file, vector, save_dtype, metadata):
+        vector_dtype = vector if save_dtype is None else vector.detach().clone().to("cpu").to(save_dtype)
+        state_dict = {
+            "emb_params": vector_dtype
+        }
 
         if os.path.splitext(file)[1] == ".safetensors":
             from safetensors.torch import save_file
@@ -182,8 +179,7 @@ class NetworkTrainer:
         train_dataloader,
         num_train_epochs,
         max_train_steps,
-        token_ids_to_string,
-        token_ids_list,
+        embedding_to_token_ids,
         orig_embeds_params_list,
         index_no_updates_list,
         save_dtype,
@@ -197,15 +193,15 @@ class NetworkTrainer:
         loss_recorder = train_util.LossRecorder()
 
         # function for saving/removing
-        def save_embeddings(embed_name, embeddings):
+        def save_embeddings(embed_name, embedding_vector):
             os.makedirs(args.output_dir, exist_ok=True)
             embeds_file = os.path.join(args.output_dir, embed_name)
 
             accelerator.print(f"\nsaving embeddings: {embeds_file}")
 
-            sai_metadata = train_util.get_sai_model_spec(None, args, self.is_sdxl, True, False)
+            sai_metadata = train_util.get_sai_model_spec(None, args, self.is_sdxl, False, True)
             embeds_file = os.path.join(args.output_dir, embed_name)
-            self.save_embeds_weights(embeds_file, embeddings, save_dtype, sai_metadata)
+            self.save_embeds_weights(embeds_file, embedding_vector, save_dtype, sai_metadata)
 
         # training loop
         for epoch in range(num_train_epochs):
@@ -311,20 +307,32 @@ class NetworkTrainer:
                         self.sample_images(accelerator, args, None, global_step, accelerator.device, vae, tokenizer, text_encoder, unet)
 
                     # 指定ステップごとにモデルを保存
-                    if args.save_every_n_steps is not None and global_step % args.save_every_n_steps == 0:
+                    if args.save_all_inversion and args.save_every_n_steps is not None and global_step % args.save_every_n_steps == 0:
                         accelerator.wait_for_everyone()
                         if accelerator.is_main_process:
-                            for token_id in token_ids_list:
-                                updated_embs = (
+                            for emb_name in embedding_to_token_ids.keys():
+                                token_ids = embedding_to_token_ids[emb_name]
+                                embedding_vector = (
                                     accelerator.unwrap_model(text_encoder)
                                     .get_input_embeddings()
-                                    .weight[token_id]
+                                    .weight[token_ids]
                                     .data.detach()
                                     .clone()
                                 )
-                                emb_name = token_ids_to_string[token_id]
                                 ckpt_name = train_util.get_step_ckpt_name(args,  "." + args.save_model_as, global_step, emb_name)
-                                save_embeddings(ckpt_name, updated_embs)
+                                save_embeddings(ckpt_name, embedding_vector)
+
+                            # for token_id in token_ids_list:
+                            #     updated_embs = (
+                            #         accelerator.unwrap_model(text_encoder)
+                            #         .get_input_embeddings()
+                            #         .weight[token_id]
+                            #         .data.detach()
+                            #         .clone()
+                            #     )
+                            #     emb_name = token_ids_to_string[token_id]
+                            #     ckpt_name = train_util.get_step_ckpt_name(args,  "." + args.save_model_as, global_step, emb_name)
+                            #     save_embeddings(ckpt_name, updated_embs)
 
                 current_loss = loss.detach().item()
                 loss_recorder.add(epoch=epoch, step=step, loss=current_loss)
@@ -346,17 +354,20 @@ class NetworkTrainer:
             accelerator.wait_for_everyone()
 
             # 指定エポックごとにモデルを保存
-            if args.save_every_n_epochs is not None:
+            if args.save_all_inversion and args.save_every_n_epochs is not None:
                 saving = (epoch + 1) % args.save_every_n_epochs == 0 and (epoch + 1) < num_train_epochs
                 if accelerator.is_main_process and saving:
-                    for token_id in token_ids_list:
-                        updated_embs = accelerator.unwrap_model(text_encoder).get_input_embeddings().weight[token_id].data.detach().clone()
-                        emb_name = token_ids_to_string[token_id]
-                        ckpt_name = train_util.get_step_ckpt_name(args,  "." + args.save_model_as, global_step, emb_name)
-                        save_embeddings(ckpt_name, updated_embs)
-
-                    if args.save_state:
-                        train_util.save_and_remove_state_on_epoch_end(args, accelerator, epoch + 1)
+                    for emb_name in embedding_to_token_ids.keys():
+                        token_ids = embedding_to_token_ids[emb_name]
+                        embedding_vector = (
+                            accelerator.unwrap_model(text_encoder)
+                            .get_input_embeddings()
+                            .weight[token_ids]
+                            .data.detach()
+                            .clone()
+                        )
+                        ckpt_name = train_util.get_epoch_ckpt_name(args,  "." + args.save_model_as, epoch + 1, emb_name)
+                        save_embeddings(ckpt_name, embedding_vector)
 
             if args.sample_ti:
                 self.sample_images(
@@ -381,14 +392,53 @@ class NetworkTrainer:
         text_encoder = accelerator.unwrap_model(text_encoder)
 
         embs_map = {}
-        for token_id in token_ids_list:
-            updated_embs = text_encoder.get_input_embeddings().weight[token_id].data.detach().clone()
-            emb_name = token_ids_to_string[token_id]
+        for emb_name in embedding_to_token_ids.keys():
+            token_ids = embedding_to_token_ids[emb_name]
+            embedding_vector = (
+                text_encoder
+                .get_input_embeddings()
+                .weight[token_ids]
+                .data.detach()
+                .clone()
+            )
             ckpt_name = train_util.get_last_ckpt_name(args,  "." + args.save_model_as, emb_name)
-            save_embeddings(ckpt_name, updated_embs)
-            embs_map[emb_name] = updated_embs
+            save_embeddings(ckpt_name, embedding_vector)
+            embs_map[emb_name] = embedding_vector
 
         return embs_map
+
+    def create_embedding_from_data(self, data, name='unknown'):
+        if 'string_to_param' in data:  # textual inversion embeddings
+            param_dict = data['string_to_param']
+            param_dict = getattr(param_dict, '_parameters', param_dict)  # fix for torch 1.12.1 loading saved file from torch 1.11
+
+            assert (
+                len(param_dict) == 1
+            ), f"embedding file has multiple terms in it: {name}"
+
+            emb = next(iter(param_dict.items()))[1]
+            vec = emb.detach()
+            shape = vec.shape[-1]
+            vectors = vec.shape[0]
+        elif type(data) == dict and 'clip_g' in data and 'clip_l' in data:  # SDXL embedding
+            vec = {k: v.detach() for k, v in data.items()}
+            shape = data['clip_g'].shape[-1] + data['clip_l'].shape[-1]
+            vectors = data['clip_g'].shape[0]
+        elif type(data) == dict and type(next(iter(data.values()))) == torch.Tensor:  # diffuser concepts
+            assert (
+                len(data.keys()) == 1
+            ), f"embedding file has multiple terms in it: {name}"
+
+            emb = next(iter(data.values()))
+            if len(emb.shape) == 1:
+                emb = emb.unsqueeze(0)
+            vec = emb.detach()
+            shape = vec.shape[-1]
+            vectors = vec.shape[0]
+        else:
+            raise Exception(f"Couldn't identify {name} as neither textual inversion embedding nor diffuser concept.")
+
+        return vec, shape, vectors
 
     def train(self, args):
         session_id = random.randint(0, 2**32)
@@ -429,33 +479,77 @@ class NetworkTrainer:
             vae.set_use_memory_efficient_attention_xformers(args.xformers)
 
         # prepare embeddings (for pivotal tuning)
-        pivotal_tuning = len(args.embeddings) > 0
-        if pivotal_tuning:
+        train_embeddings = len(args.train_embeddings) > 0
+
+        # load from existing files
+        embeddings_map = {}
+        embedding_to_token_ids = {}
+        if len(args.embeddings) > 0:
+            for embeds_file in args.embeddings:
+                if model_util.is_safetensors(embeds_file):
+                    from safetensors.torch import load_file
+
+                    data = load_file(embeds_file)
+                else:
+                    data = torch.load(embeds_file, map_location="cpu")
+
+                token_string = os.path.splitext(os.path.basename(embeds_file))[0]
+                embeds, _shape, num_vectors_per_token = self.create_embedding_from_data(data, token_string)
+
+                token_strings = [token_string] + [f"{token_string}{i+1}" for i in range(num_vectors_per_token - 1)]
+                accelerator.print("Loaded token strings", token_strings)
+                for i, (tokenizer, text_encoder) in enumerate(zip(tokenizers, text_encoders)):
+                    num_added_tokens = tokenizer.add_tokens(token_strings)
+
+                    assert (
+                        num_added_tokens == num_vectors_per_token
+                    ), f"tokenizer has same word to token string (filename). please rename the file / 指定した名前（ファイル名）のトークンが既に存在します。ファイルをリネームしてください: {embeds_file}"
+
+                    token_ids = tokenizer.convert_tokens_to_ids(token_strings)
+                    accelerator.print(f"Textual Inversion embeddings `{token_string}` loaded. Tokens are added: {token_ids}")
+                    assert (
+                        min(token_ids) == token_ids[0] and token_ids[-1] == token_ids[0] + len(token_ids) - 1
+                    ), f"token ids is not ordered : tokenizer {i+1}, {token_ids}"
+                    assert (
+                        len(tokenizer) - 1 == token_ids[-1]
+                    ), f"token ids is not end of tokenize: tokenizer {i+1}, {token_ids}, {len(tokenizer)}"
+
+                    # Resize the token embeddings as we are adding new special tokens to the tokenizer
+                    text_encoder.resize_token_embeddings(len(tokenizer))
+
+                    # TODO: Initialise the newly added placeholder token with the embeddings of the initializer token
+                    token_embeds = text_encoder.get_input_embeddings().weight.data
+                    for token_id, embed in zip(token_ids, embeds):
+                        token_embeds[token_id] = embed
+
+                    embeddings_map[token_string] = embeds
+
+        # train new embeddings
+        if train_embeddings:
             assert (
                 args.embeddings_lr is not None
-            ), "Embeddings LR needs to be defined when doing pivotal tuning"
+            ), "Embeddings LR needs to be defined when training new embeddings"
             
-            token_strings = args.embeddings
             token_ids_list = []
-            token_embeds_list = []
-            token_ids_to_string = {}
-            for i, (tokenizer, text_encoder) in enumerate(zip(tokenizers, text_encoders)):
-                for token_string in token_strings:
-                    num_added_tokens = tokenizer.add_tokens(token_string)
+            new_embeddings = args.train_embeddings
+            num_vectors_per_token = args.num_vectors_per_token
+            for token_string in new_embeddings:
+                token_strings = [token_string] + [f"{token_string}{i+1}" for i in range(num_vectors_per_token - 1)]
+                for i, (tokenizer, text_encoder) in enumerate(zip(tokenizers, text_encoders)):
+                    num_added_tokens = tokenizer.add_tokens(token_strings)
                     assert (
-                        num_added_tokens != 0 # TODO: args.num_vectors_per_token?
+                        num_added_tokens == num_vectors_per_token
                     ), f"The tokenizer already contains {token_string}. Please pass a different word that is not already in the tokenizer."
 
-                    token_id = tokenizer.convert_tokens_to_ids(token_string)
-                    token_ids_to_string[token_id] = token_string
-                    accelerator.print(f"tokens are added for tokenizer {i+1}: {token_id}")
-                    # assert (
-                    #     min(token_ids) == token_ids[0] and token_ids[-1] == token_ids[0] + len(token_ids) - 1
-                    # ), f"token ids is not ordered : tokenizer {i+1}, {token_ids}"
+                    token_ids = tokenizer.convert_tokens_to_ids(token_strings)
+                    accelerator.print(f"tokens are added for tokenizer {i+1}: {token_ids}")
                     assert (
-                        len(tokenizer) - 1 == token_id
+                        min(token_ids) == token_ids[0] and token_ids[-1] == token_ids[0] + len(token_ids) - 1
+                    ), f"token ids is not ordered : tokenizer {i+1}, {token_ids}"
+                    assert (
+                        len(tokenizer) - 1 == token_ids[-1]
                     ), f"token ids is not end of tokenize: tokenizer {i+1}, {token_ids}, {len(tokenizer)}"
-                    token_ids_list.append(token_id)
+                    token_ids_list.append(token_ids)
 
                     # Resize the token embeddings as we are adding new special tokens to the tokenizer
                     text_encoder.resize_token_embeddings(len(tokenizer))
@@ -465,14 +559,14 @@ class NetworkTrainer:
 
                     # init token values
                     # TODO: add token_string for initialization (in args)
-                    # for i, token_id in enumerate(token_ids):
-                    sigma_val = 0.5
-                    token_embeds[token_id] = torch.randn_like(token_embeds[0]) * sigma_val
-                    print(
-                        f"Initialized {token_id} with random noise (sigma={sigma_val}), empirically {token_embeds[token_id].mean().item():.3f} +- {token_embeds[token_id].std().item():.3f}"
-                    )
+                    for i, token_id in enumerate(token_ids):
+                        sigma_val = 0.5
+                        token_embeds[token_id] = torch.randn_like(token_embeds[0]) * sigma_val
+                        print(
+                            f"Initialized {token_id} with random noise (sigma={sigma_val}), empirically {token_embeds[token_id].mean().item():.3f} +- {token_embeds[token_id].std().item():.3f}"
+                        )
 
-                    token_embeds_list.append(token_embeds)
+                    embedding_to_token_ids[token_string] = token_ids
 
         # データセットを準備する
         if args.dataset_class is None:
@@ -640,7 +734,7 @@ class NetworkTrainer:
         try:
             trainable_params = network.prepare_optimizer_params(args.text_encoder_lr, args.unet_lr, args.learning_rate)
 
-            if pivotal_tuning:
+            if train_embeddings:
                 pt_trainable_params = []
                 for text_encoder in text_encoders:
                     pt_trainable_params += text_encoder.get_input_embeddings().parameters()
@@ -652,7 +746,7 @@ class NetworkTrainer:
 
         optimizer_name, optimizer_args, optimizer = train_util.get_optimizer(args, trainable_params)
 
-        if pivotal_tuning:
+        if train_embeddings:
             _, _, optimizer_ti = train_util.get_optimizer(args, pt_trainable_params, True)
 
         # dataloaderを準備する
@@ -692,7 +786,7 @@ class NetworkTrainer:
         # lr schedulerを用意する
         lr_scheduler = train_util.get_scheduler_fix(args, optimizer, accelerator.num_processes)
 
-        if pivotal_tuning:
+        if train_embeddings:
             lr_scheduler_ti = train_util.get_scheduler_fix(args, optimizer_ti, accelerator.num_processes, args.embeddings_max_train_steps)
 
         # 実験的機能：勾配も含めたfp16/bf16学習を行う　モデル全体をfp16/bf16にする
@@ -718,7 +812,7 @@ class NetworkTrainer:
         accelerator_components = [network, optimizer, train_dataloader, lr_scheduler]
         accelerator_components += [unet] if train_unet else []
         accelerator_components += text_encoders if train_text_encoder else []
-        accelerator_components += [optimizer_ti, lr_scheduler_ti] if pivotal_tuning else []
+        accelerator_components += [optimizer_ti, lr_scheduler_ti] if train_embeddings else []
         
         # accelerator prepare
         prepared_components = accelerator.prepare(*accelerator_components)
@@ -746,8 +840,8 @@ class NetworkTrainer:
             else:
                 text_encoder = text_encoders[0]
         
-        # Update optimizer_ti and lr_scheduler_ti if pivotal_tuning is True
-        if pivotal_tuning:
+        # Update optimizer_ti and lr_scheduler_ti if train_embeddings is True
+        if train_embeddings:
             optimizer_ti, lr_scheduler_ti = prepared_components[index:index+2]
             index += 2
 
@@ -755,11 +849,12 @@ class NetworkTrainer:
         text_encoders = train_util.transform_models_if_DDP(text_encoders)
         unet, network = train_util.transform_models_if_DDP([unet, network])
 
-        if pivotal_tuning:
+        # Build list of original embeddings to freeze all but the modified embeddings
+        if train_embeddings:
             index_no_updates_list = []
             orig_embeds_params_list = []
-            for token_id in token_ids_list:
-                index_no_updates = torch.arange(len(tokenizer)) < token_id
+            for tokenizer, token_ids, text_encoder in zip(tokenizers, token_ids_list, text_encoders):
+                index_no_updates = torch.arange(len(tokenizer)) < token_ids[0]
                 index_no_updates_list.append(index_no_updates)
 
                 # accelerator.print(len(index_no_updates), torch.sum(index_no_updates))
@@ -793,8 +888,6 @@ class NetworkTrainer:
                 t_enc.eval()
 
         del t_enc
-
-        network.prepare_grad_etc(text_encoder, unet)
 
         if not cache_latents:  # キャッシュしない場合はVAEを使うのでVAEを準備する
             vae.requires_grad_(False)
@@ -1076,10 +1169,40 @@ class NetworkTrainer:
             sai_metadata = train_util.get_sai_model_spec(None, args, self.is_sdxl, True, False)
             metadata_to_save.update(sai_metadata)
 
-            for emb_name in embeddings_map.keys():
-                unwrapped_nw.state_dict()[f"bundle_emb.{emb_name}.weight"] = embeddings_map[emb_name]
+            if len(embeddings_map.keys()) > 0: 
+                # Bundle embeddings in LoRA state dict
+                state_dict = unwrapped_nw.state_dict()
+                for emb_name in embeddings_map.keys():
+                    accelerator.print(f"Bundling embedding: {emb_name}")
+                    key = f"bundle_emb.{emb_name}.string_to_param.*"
+                    state_dict[key] = embeddings_map[emb_name]
+                    
+                if metadata_to_save is not None and len(metadata_to_save) == 0:
+                    metadata_to_save = None
 
-            unwrapped_nw.save_weights(ckpt_file, save_dtype, metadata_to_save)
+                # Save LoRA
+                if save_dtype is not None:
+                    for key in list(state_dict.keys()):
+                        v = state_dict[key]
+                        v = v.detach().clone().to("cpu").to(save_dtype)
+                        state_dict[key] = v
+
+                if os.path.splitext(ckpt_file)[1] == ".safetensors":
+                    from safetensors.torch import save_file
+
+                    # Precalculate model hashes to save time on indexing
+                    if metadata_to_save is None:
+                        metadata_to_save = {}
+                    model_hash, legacy_hash = train_util.precalculate_safetensors_hashes(state_dict, metadata_to_save)
+                    metadata_to_save["sshs_model_hash"] = model_hash
+                    metadata_to_save["sshs_legacy_hash"] = legacy_hash
+
+                    save_file(state_dict, ckpt_file, metadata_to_save)
+                else:
+                    torch.save(state_dict, ckpt_file)
+            else:
+                unwrapped_nw.save_weights(ckpt_file, save_dtype, metadata_to_save)
+
             if args.huggingface_repo_id is not None:
                 huggingface_util.upload(args, ckpt_file, "/" + ckpt_name, force_sync_upload=force_sync_upload)
 
@@ -1089,10 +1212,11 @@ class NetworkTrainer:
                 accelerator.print(f"removing old checkpoint: {old_ckpt_file}")
                 os.remove(old_ckpt_file)
 
-        if pivotal_tuning:
+        if train_embeddings:
             num_train_epochs_ti = math.ceil(args.embeddings_max_train_steps / num_update_steps_per_epoch)
             max_train_steps_ti = args.embeddings_max_train_steps
-            embeddings_map = self.train_inversion(
+
+            trained_embeddings_dict = self.train_inversion(
                 args,
                 accelerator,
                 unet,
@@ -1108,21 +1232,24 @@ class NetworkTrainer:
                 train_dataloader,
                 num_train_epochs_ti,
                 max_train_steps_ti,
-                token_ids_to_string,
-                token_ids_list,
+                embedding_to_token_ids,
                 orig_embeds_params_list,
                 index_no_updates_list,
                 save_dtype,
                 current_epoch,
                 current_step
             )
+            embeddings_map.update(trained_embeddings_dict)
 
             del optimizer_ti
             del lr_scheduler_ti
 
-        if not args.continue_inversion:
+        if args.stop_inversion:
+            # TODO: add the embedding to the LoRA module to continue training
             for t_enc in text_encoders:
                 t_enc.requires_grad_(False)
+
+        network.prepare_grad_etc(text_encoder, unet)
 
         # training loop
         for epoch in range(num_train_epochs):
@@ -1394,21 +1521,32 @@ def setup_parser() -> argparse.ArgumentParser:
     # Pivotal tuning
     parser.add_argument(
         "--embeddings",
+        type=str,
+        default=[],
+        nargs="*",
+        help="Embeddings files of Textual Inversion / Textual Inversionのembeddings", # TODO: use existing embeddings instead of training new ones
+    )
+    parser.add_argument(
+        "--train_embeddings",
         default=[],
         type=str,
         nargs="+",
         help="Embeddings to train for Pivotal Tuning (default is empty array) / 日本語訳なし"
     )
+    parser.add_argument(
+        "--num_vectors_per_token", type=int, default=1, help="number of vectors per token / トークンに割り当てるembeddingsの要素数"
+    )
     parser.add_argument("--embeddings_lr", type=float, default=None, help="learning rate for TI (Pivotal Tuning) / embeddingsの学習率")
-    parser.add_argument("--embeddings_max_train_steps", type=int, default=1600, help="training steps for TI (Pivotal Tuning) / TIの学習ステップ数")
+    parser.add_argument("--embeddings_max_train_steps", type=int, default=1600, help="training steps for embeddings (Pivotal Tuning) / embeddingsの学習ステップ数")
     parser.add_argument(
         "--embeddings_max_train_epochs",
         type=int,
         default=None,
-        help="training epochs for TI (Pivotal Tuning, overrides embeddings_max_train_steps) / TIの学習エポック数（embeddings_max_train_stepsを上書きします）",
+        help="training epochs for embeddings (Pivotal Tuning, overrides embeddings_max_train_steps) / embeddingsの学習エポック数（embeddings_max_train_stepsを上書きします）",
     )
-    parser.add_argument("--continue_inversion", action="store_true", default=True, help="Continue inversion when training the LoRA after TI")
-    parser.add_argument("--sample_ti", action="store_true", default=False, help="Continue inversion when training the LoRA after TI")
+    parser.add_argument("--save_all_inversion", action="store_true", help="Save all TI epochs/steps for embeddings (default to only saving the last step)")
+    parser.add_argument("--stop_inversion", action="store_true", help="Stop inversion when training the LoRA after TI")
+    parser.add_argument("--sample_ti", action="store_true", help="Sample images when training embeddings during TI")
 
     return parser
 
