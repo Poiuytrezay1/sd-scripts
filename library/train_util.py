@@ -4101,13 +4101,13 @@ def get_epoch_ckpt_name(args: argparse.Namespace, ext: str, epoch_no: int):
     return EPOCH_FILE_NAME.format(model_name, epoch_no) + ext
 
 
-def get_step_ckpt_name(args: argparse.Namespace, ext: str, step_no: int):
-    model_name = default_if_none(args.output_name, DEFAULT_STEP_NAME)
+def get_step_ckpt_name(args: argparse.Namespace, ext: str, step_no: int, custom_name = None):
+    model_name = default_if_none(args.output_name, DEFAULT_STEP_NAME) if custom_name is None else custom_name
     return STEP_FILE_NAME.format(model_name, step_no) + ext
 
 
-def get_last_ckpt_name(args: argparse.Namespace, ext: str):
-    model_name = default_if_none(args.output_name, DEFAULT_LAST_OUTPUT_NAME)
+def get_last_ckpt_name(args: argparse.Namespace, ext: str, custom_name = None):
+    model_name = default_if_none(args.output_name, DEFAULT_LAST_OUTPUT_NAME) if custom_name is None else custom_name
     return model_name + ext
 
 
