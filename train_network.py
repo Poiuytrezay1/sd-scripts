@@ -245,54 +245,54 @@ class NetworkTrainer:
                                 args, accelerator, batch, tokenizers, text_encoders, weight_dtype
                             )
 
-                    # Sample noise, sample a random timestep for each image, and add noise to the latents,
-                    # with noise offset and/or multires noise if specified
-                    noise, noisy_latents, timesteps = train_util.get_noise_noisy_latents_and_timesteps(
-                        args, noise_scheduler, latents
-                    )
-
-                    # Predict the noise residual
-                    with accelerator.autocast():
-                        noise_pred = self.call_unet(
-                            args, accelerator, unet, noisy_latents, timesteps, text_encoder_conds, batch, weight_dtype
+                        # Sample noise, sample a random timestep for each image, and add noise to the latents,
+                        # with noise offset and/or multires noise if specified
+                        noise, noisy_latents, timesteps = train_util.get_noise_noisy_latents_and_timesteps(
+                            args, noise_scheduler, latents
                         )
 
-                    if args.v_parameterization:
-                        # v-parameterization training
-                        target = noise_scheduler.get_velocity(latents, noise, timesteps)
-                    else:
-                        target = noise
+                        # Predict the noise residual
+                        with accelerator.autocast():
+                            noise_pred = self.call_unet(
+                                args, accelerator, unet, noisy_latents, timesteps, text_encoder_conds, batch, weight_dtype
+                            )
 
-                    loss = torch.nn.functional.mse_loss(noise_pred.float(), target.float(), reduction="none")
-                    loss = loss.mean([1, 2, 3])
+                        if args.v_parameterization:
+                            # v-parameterization training
+                            target = noise_scheduler.get_velocity(latents, noise, timesteps)
+                        else:
+                            target = noise
 
-                    loss_weights = batch["loss_weights"]  # 各sampleごとのweight
-                    loss = loss * loss_weights
+                        loss = torch.nn.functional.mse_loss(noise_pred.float(), target.float(), reduction="none")
+                        loss = loss.mean([1, 2, 3])
 
-                    if args.min_snr_gamma:
-                        loss = apply_snr_weight(loss, timesteps, noise_scheduler, args.min_snr_gamma)
-                    if args.scale_v_pred_loss_like_noise_pred:
-                        loss = scale_v_prediction_loss_like_noise_prediction(loss, timesteps, noise_scheduler)
-                    if args.v_pred_like_loss:
-                        loss = add_v_prediction_like_loss(loss, timesteps, noise_scheduler, args.v_pred_like_loss)
-                    if args.debiased_estimation_loss:
-                        loss = apply_debiased_estimation(loss, timesteps, noise_scheduler)
+                        loss_weights = batch["loss_weights"]  # 各sampleごとのweight
+                        loss = loss * loss_weights
 
-                    loss = loss.mean()  # 平均なのでbatch_sizeで割る必要なし
+                        if args.min_snr_gamma:
+                            loss = apply_snr_weight(loss, timesteps, noise_scheduler, args.min_snr_gamma)
+                        if args.scale_v_pred_loss_like_noise_pred:
+                            loss = scale_v_prediction_loss_like_noise_prediction(loss, timesteps, noise_scheduler)
+                        if args.v_pred_like_loss:
+                            loss = add_v_prediction_like_loss(loss, timesteps, noise_scheduler, args.v_pred_like_loss)
+                        if args.debiased_estimation_loss:
+                            loss = apply_debiased_estimation(loss, timesteps, noise_scheduler)
 
-                    accelerator.backward(loss)
-                    if accelerator.sync_gradients and args.max_grad_norm != 0.0:
-                        params_to_clip = text_encoder.get_input_embeddings().parameters()
-                        accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+                        loss = loss.mean()  # 平均なのでbatch_sizeで割る必要なし
 
-                    optimizer.step()
-                    lr_scheduler.step()
-                    optimizer.zero_grad(set_to_none=True)
+                        accelerator.backward(loss)
+                        if accelerator.sync_gradients and args.max_grad_norm != 0.0:
+                            params_to_clip = text_encoder.get_input_embeddings().parameters()
+                            accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+
+                        optimizer.step()
+                        lr_scheduler.step()
+                        optimizer.zero_grad(set_to_none=True)
 
                     # Let's make sure we don't update any embedding weights besides the newly added token
                     with torch.no_grad():
-                        for orig_embeds_params, index_no_updates in zip(
-                            orig_embeds_params_list, index_no_updates_list
+                        for text_encoder, orig_embeds_params, index_no_updates in zip(
+                            text_encoders, orig_embeds_params_list, index_no_updates_list
                         ):
                             accelerator.unwrap_model(text_encoder).get_input_embeddings().weight[
                                 index_no_updates
@@ -321,18 +321,6 @@ class NetworkTrainer:
                                 )
                                 ckpt_name = train_util.get_step_ckpt_name(args,  "." + args.save_model_as, global_step, emb_name)
                                 save_embeddings(ckpt_name, embedding_vector)
-
-                            # for token_id in token_ids_list:
-                            #     updated_embs = (
-                            #         accelerator.unwrap_model(text_encoder)
-                            #         .get_input_embeddings()
-                            #         .weight[token_id]
-                            #         .data.detach()
-                            #         .clone()
-                            #     )
-                            #     emb_name = token_ids_to_string[token_id]
-                            #     ckpt_name = train_util.get_step_ckpt_name(args,  "." + args.save_model_as, global_step, emb_name)
-                            #     save_embeddings(ckpt_name, updated_embs)
 
                 current_loss = loss.detach().item()
                 loss_recorder.add(epoch=epoch, step=step, loss=current_loss)
@@ -503,7 +491,7 @@ class NetworkTrainer:
 
                     assert (
                         num_added_tokens == num_vectors_per_token
-                    ), f"tokenizer has same word to token string (filename). please rename the file / 指定した名前（ファイル名）のトークンが既に存在します。ファイルをリネームしてください: {embeds_file}"
+                    ), f"The tokenizer already contains {token_string}. Please pass a different word that is not already in the tokenizer. / 指定した名前（ファイル名）のトークンが既に存在します。ファイルをリネームしてください: {embeds_file}"
 
                     token_ids = tokenizer.convert_tokens_to_ids(token_strings)
                     accelerator.print(f"Textual Inversion embeddings `{token_string}` loaded. Tokens are added: {token_ids}")
@@ -517,11 +505,8 @@ class NetworkTrainer:
                     # Resize the token embeddings as we are adding new special tokens to the tokenizer
                     text_encoder.resize_token_embeddings(len(tokenizer))
 
-                    # TODO: Initialise the newly added placeholder token with the embeddings of the initializer token
-                    token_embeds = text_encoder.get_input_embeddings().weight.data
                     for token_id, embed in zip(token_ids, embeds):
-                        token_embeds[token_id] = embed
-
+                        text_encoder.get_input_embeddings().weight.data[token_id] = embed
                     embeddings_map[token_string] = embeds
 
         # train new embeddings
@@ -535,7 +520,7 @@ class NetworkTrainer:
             num_vectors_per_token = args.num_vectors_per_token
             for token_string in new_embeddings:
                 token_strings = [token_string] + [f"{token_string}{i+1}" for i in range(num_vectors_per_token - 1)]
-                for i, (tokenizer, text_encoder) in enumerate(zip(tokenizers, text_encoders)):
+                for i, (tokenizer, t_enc) in enumerate(zip(tokenizers, text_encoders)):
                     num_added_tokens = tokenizer.add_tokens(token_strings)
                     assert (
                         num_added_tokens == num_vectors_per_token
@@ -552,13 +537,12 @@ class NetworkTrainer:
                     token_ids_list.append(token_ids)
 
                     # Resize the token embeddings as we are adding new special tokens to the tokenizer
-                    text_encoder.resize_token_embeddings(len(tokenizer))
+                    t_enc.resize_token_embeddings(len(tokenizer))
 
                     # TODO: Initialise the newly added placeholder token with the embeddings of the initializer token
-                    token_embeds = text_encoder.get_input_embeddings().weight.data
+                    token_embeds = t_enc.get_input_embeddings().weight.data
 
                     # init token values
-                    # TODO: add token_string for initialization (in args)
                     for i, token_id in enumerate(token_ids):
                         sigma_val = 0.5
                         token_embeds[token_id] = torch.randn_like(token_embeds[0]) * sigma_val
@@ -733,11 +717,6 @@ class NetworkTrainer:
         # 後方互換性を確保するよ
         try:
             trainable_params = network.prepare_optimizer_params(args.text_encoder_lr, args.unet_lr, args.learning_rate)
-
-            if train_embeddings:
-                pt_trainable_params = []
-                for text_encoder in text_encoders:
-                    pt_trainable_params += text_encoder.get_input_embeddings().parameters()
         except TypeError:
             accelerator.print(
                 "Deprecated: use prepare_optimizer_params(text_encoder_lr, unet_lr, learning_rate) instead of prepare_optimizer_params(text_encoder_lr, unet_lr)"
@@ -745,9 +724,6 @@ class NetworkTrainer:
             trainable_params = network.prepare_optimizer_params(args.text_encoder_lr, args.unet_lr)
 
         optimizer_name, optimizer_args, optimizer = train_util.get_optimizer(args, trainable_params)
-
-        if train_embeddings:
-            _, _, optimizer_ti = train_util.get_optimizer(args, pt_trainable_params, True)
 
         # dataloaderを準備する
         # DataLoaderのプロセス数：0はメインプロセスになる
@@ -786,9 +762,6 @@ class NetworkTrainer:
         # lr schedulerを用意する
         lr_scheduler = train_util.get_scheduler_fix(args, optimizer, accelerator.num_processes)
 
-        if train_embeddings:
-            lr_scheduler_ti = train_util.get_scheduler_fix(args, optimizer_ti, accelerator.num_processes, args.embeddings_max_train_steps)
-
         # 実験的機能：勾配も含めたfp16/bf16学習を行う　モデル全体をfp16/bf16にする
         if args.full_fp16:
             assert (
@@ -805,8 +778,19 @@ class NetworkTrainer:
 
         unet.requires_grad_(False)
         unet.to(dtype=weight_dtype)
-        for t_enc in text_encoders:
-            t_enc.requires_grad_(False)
+
+        if not train_embeddings:
+            for t_enc in text_encoders:
+                t_enc.requires_grad_(False)
+
+        if train_embeddings:
+            # Prepare optimizer and scheduler for TI
+            # TODO: only train new embeddings instead of everything
+            pt_trainable_params = []
+            for t_enc in text_encoders:
+                pt_trainable_params += t_enc.get_input_embeddings().parameters()
+            _, _, optimizer_ti = train_util.get_optimizer(args, pt_trainable_params, True)
+            lr_scheduler_ti = train_util.get_scheduler_fix(args, optimizer_ti, accelerator.num_processes, args.embeddings_max_train_steps)
 
         # acceleratorがなんかよろしくやってくれるらしい
         accelerator_components = [network, optimizer, train_dataloader, lr_scheduler]
@@ -1149,12 +1133,6 @@ class NetworkTrainer:
         loss_recorder = train_util.LossRecorder()
         del train_dataset_group
 
-        # callback for step start
-        if hasattr(network, "on_step_start"):
-            on_step_start = network.on_step_start
-        else:
-            on_step_start = lambda *args, **kwargs: None
-
         # function for saving/removing
         def save_model(ckpt_name, unwrapped_nw, steps, epoch_no, embeddings_map, force_sync_upload=False):
             os.makedirs(args.output_dir, exist_ok=True)
@@ -1227,8 +1205,8 @@ class NetworkTrainer:
                 vae,
                 vae_dtype,
                 weight_dtype,
-                optimizer,
-                lr_scheduler,
+                optimizer_ti,
+                lr_scheduler_ti,
                 train_dataloader,
                 num_train_epochs_ti,
                 max_train_steps_ti,
@@ -1244,10 +1222,16 @@ class NetworkTrainer:
             del optimizer_ti
             del lr_scheduler_ti
 
+        # TODO: add the embedding to the LoRA module to continue training
         if args.stop_inversion:
-            # TODO: add the embedding to the LoRA module to continue training
             for t_enc in text_encoders:
                 t_enc.requires_grad_(False)
+
+        # callback for step start
+        if hasattr(network, "on_step_start"):
+            on_step_start = network.on_step_start
+        else:
+            on_step_start = lambda *args, **kwargs: None
 
         network.prepare_grad_etc(text_encoder, unet)
 
