@@ -4096,8 +4096,8 @@ def default_if_none(value, default):
     return default if value is None else value
 
 
-def get_epoch_ckpt_name(args: argparse.Namespace, ext: str, epoch_no: int):
-    model_name = default_if_none(args.output_name, DEFAULT_EPOCH_NAME)
+def get_epoch_ckpt_name(args: argparse.Namespace, ext: str, epoch_no: int, custom_name = None):
+    model_name = default_if_none(args.output_name, DEFAULT_EPOCH_NAME) if custom_name is None else custom_name
     return EPOCH_FILE_NAME.format(model_name, epoch_no) + ext
 
 
