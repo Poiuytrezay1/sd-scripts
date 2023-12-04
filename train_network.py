@@ -192,6 +192,12 @@ class NetworkTrainer:
 
         loss_recorder = train_util.LossRecorder()
 
+        # Retrieve text_encoder
+        if len(text_encoders) > 1:
+            text_encoder = text_encoders
+        else:
+            text_encoder = text_encoders[0]
+
         # function for saving/removing
         def save_embeddings(embed_name, embedding_vector):
             os.makedirs(args.output_dir, exist_ok=True)
@@ -214,7 +220,7 @@ class NetworkTrainer:
             for step, batch in enumerate(train_dataloader):
                 current_step.value = global_step
 
-                with accelerator.accumulate(text_encoder):
+                with accelerator.accumulate(text_encoders[0]):
                     with torch.no_grad():
                         if "latents" in batch and batch["latents"] is not None:
                             latents = batch["latents"].to(accelerator.device)
@@ -227,7 +233,6 @@ class NetworkTrainer:
                                 accelerator.print("NaN found in latents, replacing with zeros")
                                 latents = torch.where(torch.isnan(latents), torch.zeros_like(latents), latents)
                         latents = latents * self.vae_scale_factor
-                    b_size = latents.shape[0]
 
                     with torch.enable_grad(), accelerator.autocast():
                         # Get the text embedding for conditioning
@@ -245,49 +250,49 @@ class NetworkTrainer:
                                 args, accelerator, batch, tokenizers, text_encoders, weight_dtype
                             )
 
-                        # Sample noise, sample a random timestep for each image, and add noise to the latents,
-                        # with noise offset and/or multires noise if specified
-                        noise, noisy_latents, timesteps = train_util.get_noise_noisy_latents_and_timesteps(
-                            args, noise_scheduler, latents
+                    # Sample noise, sample a random timestep for each image, and add noise to the latents,
+                    # with noise offset and/or multires noise if specified
+                    noise, noisy_latents, timesteps = train_util.get_noise_noisy_latents_and_timesteps(
+                        args, noise_scheduler, latents
+                    )
+
+                    # Predict the noise residual
+                    with accelerator.autocast():
+                        noise_pred = self.call_unet(
+                            args, accelerator, unet, noisy_latents, timesteps, text_encoder_conds, batch, weight_dtype
                         )
 
-                        # Predict the noise residual
-                        with accelerator.autocast():
-                            noise_pred = self.call_unet(
-                                args, accelerator, unet, noisy_latents, timesteps, text_encoder_conds, batch, weight_dtype
-                            )
+                    if args.v_parameterization:
+                        # v-parameterization training
+                        target = noise_scheduler.get_velocity(latents, noise, timesteps)
+                    else:
+                        target = noise
 
-                        if args.v_parameterization:
-                            # v-parameterization training
-                            target = noise_scheduler.get_velocity(latents, noise, timesteps)
-                        else:
-                            target = noise
+                    loss = torch.nn.functional.mse_loss(noise_pred.float(), target.float(), reduction="none")
+                    loss = loss.mean([1, 2, 3])
 
-                        loss = torch.nn.functional.mse_loss(noise_pred.float(), target.float(), reduction="none")
-                        loss = loss.mean([1, 2, 3])
+                    loss_weights = batch["loss_weights"]  # 各sampleごとのweight
+                    loss = loss * loss_weights
 
-                        loss_weights = batch["loss_weights"]  # 各sampleごとのweight
-                        loss = loss * loss_weights
+                    if args.min_snr_gamma:
+                        loss = apply_snr_weight(loss, timesteps, noise_scheduler, args.min_snr_gamma)
+                    if args.scale_v_pred_loss_like_noise_pred:
+                        loss = scale_v_prediction_loss_like_noise_prediction(loss, timesteps, noise_scheduler)
+                    if args.v_pred_like_loss:
+                        loss = add_v_prediction_like_loss(loss, timesteps, noise_scheduler, args.v_pred_like_loss)
+                    if args.debiased_estimation_loss:
+                        loss = apply_debiased_estimation(loss, timesteps, noise_scheduler)
 
-                        if args.min_snr_gamma:
-                            loss = apply_snr_weight(loss, timesteps, noise_scheduler, args.min_snr_gamma)
-                        if args.scale_v_pred_loss_like_noise_pred:
-                            loss = scale_v_prediction_loss_like_noise_prediction(loss, timesteps, noise_scheduler)
-                        if args.v_pred_like_loss:
-                            loss = add_v_prediction_like_loss(loss, timesteps, noise_scheduler, args.v_pred_like_loss)
-                        if args.debiased_estimation_loss:
-                            loss = apply_debiased_estimation(loss, timesteps, noise_scheduler)
+                    loss = loss.mean()  # 平均なのでbatch_sizeで割る必要なし
 
-                        loss = loss.mean()  # 平均なのでbatch_sizeで割る必要なし
+                    accelerator.backward(loss)
+                    if accelerator.sync_gradients and args.max_grad_norm != 0.0:
+                        params_to_clip = text_encoder.get_input_embeddings().parameters()
+                        accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
 
-                        accelerator.backward(loss)
-                        if accelerator.sync_gradients and args.max_grad_norm != 0.0:
-                            params_to_clip = text_encoder.get_input_embeddings().parameters()
-                            accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
-
-                        optimizer.step()
-                        lr_scheduler.step()
-                        optimizer.zero_grad(set_to_none=True)
+                    optimizer.step()
+                    lr_scheduler.step()
+                    optimizer.zero_grad(set_to_none=True)
 
                     # Let's make sure we don't update any embedding weights besides the newly added token
                     with torch.no_grad():
@@ -466,9 +471,8 @@ class NetworkTrainer:
         if torch.__version__ >= "2.0.0":  # PyTorch 2.0.0 以上対応のxformersなら以下が使える
             vae.set_use_memory_efficient_attention_xformers(args.xformers)
 
-        # prepare embeddings (for pivotal tuning)
-        train_embeddings = len(args.train_embeddings) > 0
 
+        # prepare embeddings (for pivotal tuning)
         # load from existing files
         embeddings_map = {}
         embedding_to_token_ids = {}
@@ -510,7 +514,11 @@ class NetworkTrainer:
                     embeddings_map[token_string] = embeds
 
         # train new embeddings
+        train_embeddings = len(args.train_embeddings) > 0
         if train_embeddings:
+            assert (
+                len(args.train_embeddings) == 1
+            ), "Training embeddings only work when using a single embedding (multiple embeddings might come in the future)"
             assert (
                 args.embeddings_lr is not None
             ), "Embeddings LR needs to be defined when training new embeddings"
@@ -837,21 +845,21 @@ class NetworkTrainer:
         if train_embeddings:
             index_no_updates_list = []
             orig_embeds_params_list = []
-            for tokenizer, token_ids, text_encoder in zip(tokenizers, token_ids_list, text_encoders):
+            for tokenizer, token_ids, t_enc in zip(tokenizers, token_ids_list, text_encoders):
                 index_no_updates = torch.arange(len(tokenizer)) < token_ids[0]
                 index_no_updates_list.append(index_no_updates)
 
                 # accelerator.print(len(index_no_updates), torch.sum(index_no_updates))
-                orig_embeds_params = accelerator.unwrap_model(text_encoder).get_input_embeddings().weight.data.detach().clone()
+                orig_embeds_params = accelerator.unwrap_model(t_enc).get_input_embeddings().weight.data.detach().clone()
                 orig_embeds_params_list.append(orig_embeds_params)
 
                 # Freeze all parameters except for the token embeddings in text encoder
-                text_encoder.requires_grad_(True)
-                text_encoder.text_model.encoder.requires_grad_(False)
-                text_encoder.text_model.final_layer_norm.requires_grad_(False)
-                text_encoder.text_model.embeddings.position_embedding.requires_grad_(False)
+                t_enc.requires_grad_(True)
+                t_enc.text_model.encoder.requires_grad_(False)
+                t_enc.text_model.final_layer_norm.requires_grad_(False)
+                t_enc.text_model.embeddings.position_embedding.requires_grad_(False)
                 # t_enc.text_model.embeddings.requires_grad_(True)
-                # text_encoder.text_model.embeddings.token_embedding.requires_grad_(True)
+                # t_enc.text_model.embeddings.token_embedding.requires_grad_(True)
 
         if args.gradient_checkpointing:
             # according to TI example in Diffusers, train is required
